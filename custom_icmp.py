@@ -1,22 +1,15 @@
 import socket
 import struct
-import sys
 import os
+import sys
 import time
-import fcntl
 from ctypes import *
 
-# Проверка запуска от root
-if os.geteuid() != 0:
-    print("Ошибка: Требуются права root (sudo)")
-    sys.exit(1)
-
-# Константы
+# --- Константы ---
 ICMP_ECHO_REQUEST = 8
 ICMP_ECHO_REPLY = 0
-ETH_P_ALL = 0x0003
 
-# IP заголовок
+# --- Структуры ---
 class IP(Structure):
     _fields_ = [
         ("ihl", c_ubyte, 4),
@@ -32,56 +25,40 @@ class IP(Structure):
         ("dst", c_uint32),
     ]
 
-# ICMP заголовок
 class ICMP(Structure):
     _fields_ = [
         ("type", c_ubyte),
         ("code", c_ubyte),
         ("checksum", c_ushort),
         ("identifier", c_ushort),
-        ("sequence", c_ushort)
+        ("sequence", c_ushort),
     ]
 
-def checksum(source_string):
-    sum = 0
-    count_to = (len(source_string) // 2) * 2
-    count = 0
-    while count < count_to:
-        this_val = source_string[count + 1] * 256 + source_string[count]
-        sum += this_val
-        count += 2
-    if count_to < len(source_string):
-        sum += source_string[len(source_string) - 1]
-    sum = (sum >> 16) + (sum & 0xFFFF)
-    sum += (sum >> 16)
-    answer = ~sum & 0xFFFF
-    return answer >> 8 | (answer << 8 & 0xFF00)
+# --- Утилиты ---
+def checksum(data):
+    s = 0
+    for i in range(0, len(data), 2):
+        part = data[i] + (data[i+1] << 8) if i+1 < len(data) else data[i]
+        s += part
+    s = (s >> 16) + (s & 0xffff)
+    s += (s >> 16)
+    return ~s & 0xffff
 
 def ip2bin(ip):
     return struct.unpack("!I", socket.inet_aton(ip))[0]
 
-def create_icmp_packet(identifier=1, sequence=1):
-    icmp = ICMP(
-        type=ICMP_ECHO_REQUEST,
-        code=0,
-        checksum=0,
-        identifier=socket.htons(identifier),
-        sequence=socket.htons(sequence)
-    )
-    buf = bytes(icmp)
-    icmp.checksum = socket.htons(checksum(buf))
+def create_icmp_packet(ident, seq):
+    icmp = ICMP(type=ICMP_ECHO_REQUEST, code=0, checksum=0,
+                identifier=socket.htons(ident), sequence=socket.htons(seq))
+    packet = bytes(icmp)
+    icmp.checksum = socket.htons(checksum(packet))
     return bytes(icmp)
 
-def create_ip_packet(src_ip, dst_ip):
+def create_ip_header(src_ip, dst_ip):
     ip = IP(
-        ihl=5,
-        version=4,
-        tos=0,
-        len=20 + 8,
-        id=54321,
-        offset=0,
-        ttl=255,
-        protocol=socket.IPPROTO_ICMP,
+        ihl=5, version=4, tos=0, len=20+8,
+        id=os.getpid(), offset=0,
+        ttl=64, protocol=socket.IPPROTO_ICMP,
         checksum=0,
         src=ip2bin(src_ip),
         dst=ip2bin(dst_ip)
@@ -89,131 +66,75 @@ def create_ip_packet(src_ip, dst_ip):
     ip.checksum = socket.htons(checksum(bytes(ip)))
     return bytes(ip)
 
-def send_icmp(sock, src_ip, dst_ip, ident, seq):
+def send_icmp_raw(src_ip, dst_ip, ident, seq):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    ip_header = create_ip_header(src_ip, dst_ip)
     icmp_packet = create_icmp_packet(ident, seq)
-    ip_packet = create_ip_packet(src_ip, dst_ip)
-    packet = ip_packet + icmp_packet
+    packet = ip_header + icmp_packet
     sock.sendto(packet, (dst_ip, 0))
     return time.time()
 
-def get_mac(interface):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    return fcntl.ioctl(
-        s.fileno(),
-        0x8927,
-        struct.pack('256s', interface[:15].encode())
-    )[18:24]
-
-def listen_for_reply_packet_mode(sock, fake_src_ip, expected_id, expected_seq, timeout=3):
+def sniff_reply(interface, fake_src_ip, ident, seq, timeout=5):
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+    sock.bind((interface, 0))
     sock.settimeout(timeout)
+
     try:
         while True:
             packet = sock.recv(65535)
-
-            # Ethernet (14 байт) + IP (минимум 20) + ICMP (8)
             if len(packet) < 42:
                 continue
 
             eth_proto = struct.unpack('!H', packet[12:14])[0]
-            if eth_proto != 0x0800:  # Не IPv4
-                continue
+            if eth_proto != 0x0800:
+                continue  # Не IPv4
 
             ip_header = packet[14:34]
             iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
             protocol = iph[6]
-            if protocol != 1:  # Не ICMP
-                continue
+            if protocol != 1:
+                continue  # Не ICMP
 
             src_ip = socket.inet_ntoa(iph[8])
             dst_ip = socket.inet_ntoa(iph[9])
 
             icmp_header = packet[34:42]
-            if len(icmp_header) < 8:
-                continue
+            icmp_type, code, checksum_recv, recv_id, recv_seq = struct.unpack('!BBHHH', icmp_header)
 
-            icmph = struct.unpack("!BBHHH", icmp_header)
-            icmp_type = icmph[0]
-            identifier = icmph[3]
-            sequence = icmph[4]
-
-            # Только ответы (Echo Reply) на наш фейковый IP
-            if icmp_type == 0:
-                if dst_ip == fake_src_ip and identifier == socket.htons(expected_id) and sequence == socket.htons(expected_seq):
-                    return (time.time() - send_time_global) * 1000
+            # Проверка на нужный Echo Reply
+            if icmp_type == ICMP_ECHO_REPLY and dst_ip == fake_src_ip:
+                if recv_id == socket.htons(ident) and recv_seq == socket.htons(seq):
+                    return time.time()
     except socket.timeout:
         return None
 
-
+# --- Точка входа ---
 def main():
-    if len(sys.argv) != 4:
-        print("Использование: sudo {} <src_ip> <dst_ip> <interface>".format(sys.argv[0]))
+    if os.geteuid() != 0:
+        print("Ошибка: требуется запуск от root")
         sys.exit(1)
 
-    src_ip = sys.argv[1]
+    if len(sys.argv) != 4:
+        print(f"Использование: sudo {sys.argv[0]} <fake_src_ip> <dst_ip> <interface>")
+        sys.exit(1)
+
+    fake_src_ip = sys.argv[1]
     dst_ip = sys.argv[2]
     interface = sys.argv[3]
-
-    def is_valid_ip(ip):
-        parts = ip.split('.')
-        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-
-    if not (is_valid_ip(src_ip) and is_valid_ip(dst_ip)):
-        print("Ошибка: Неверный формат IP-адреса")
-        sys.exit(1)
-
-    print("ICMP-запросы от {} к {}".format(src_ip, dst_ip))
 
     ident = os.getpid() & 0xFFFF
     seq = 1
 
-    packets_sent = 0
-    packets_received = 0
-    total_rtt = 0.0
-    min_rtt = float('inf')
-    max_rtt = 0.0
+    print(f"Отправка ICMP-запроса от {fake_src_ip} к {dst_ip} через {interface}...")
 
-    try:
-        sock_send = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode())
+    send_time = send_icmp_raw(fake_src_ip, dst_ip, ident, seq)
+    recv_time = sniff_reply(interface, fake_src_ip, ident, seq, timeout=5)
 
-        sock_recv = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
-        sock_recv.bind((interface, 0))
-
-        while True:
-            print("Запрос отправлен - ", end="", flush=True)
-            packets_sent += 1
-
-            global send_time_global
-            send_time_global = send_icmp(sock_send, src_ip, dst_ip, ident, seq)
-
-            result = listen_for_reply_packet_mode(sock_recv, dst_ip, ident, seq, timeout=3)
-
-            if result is not None:
-                packets_received += 1
-                total_rtt += result
-                min_rtt = min(min_rtt, result)
-                max_rtt = max(max_rtt, result)
-                print("Ответ получен - RTT: {:.3f} ms".format(result))
-            else:
-                print("Нет ответа")
-
-            seq += 1
-            time.sleep(1)
-
-    except KeyboardInterrupt:
-        loss = ((packets_sent - packets_received) / packets_sent) * 100 if packets_sent > 0 else 0
-        avg_rtt = total_rtt / packets_received if packets_received > 0 else 0
-
-        print("\nОстановка пользователем\n")
-        print("Статистика:")
-        print("  Отправлено:   {}".format(packets_sent))
-        print("  Получено:     {}".format(packets_received))
-        print("  Потеряно:     {} ({:.2f}%)".format(packets_sent - packets_received, loss))
-        if packets_received > 0:
-            print("  Минимальный RTT: {:.3f} ms".format(min_rtt))
-            print("  Максимальный RTT: {:.3f} ms".format(max_rtt))
-            print("  Средний RTT:     {:.3f} ms".format(avg_rtt))
-        sys.exit(0)
+    if recv_time:
+        rtt = (recv_time - send_time) * 1000
+        print(f"Ответ получен! RTT: {rtt:.3f} ms")
+    else:
+        print("Ответ не получен (возможно, пакет был проигнорирован системой)")
 
 if __name__ == "__main__":
     main()
