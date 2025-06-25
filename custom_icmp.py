@@ -115,7 +115,7 @@ def main():
         sys.exit(1)
 
     if len(sys.argv) != 4:
-        print(f"Использование: sudo {sys.argv[0]} <fake_src_ip> <dst_ip> <interface>")
+        print("Использование: sudo {} <fake_src_ip> <dst_ip> <interface>".format(sys.argv[0]))
         sys.exit(1)
 
     fake_src_ip = sys.argv[1]
@@ -125,14 +125,15 @@ def main():
     ident = os.getpid() & 0xFFFF
     seq = 1
 
-    print(f"Отправка ICMP-запроса от {fake_src_ip} к {dst_ip} через {interface}...")
+    print("Отправка ICMP-запроса от {} к {} через {}...".format(fake_src_ip, dst_ip, interface))
 
     send_time = send_icmp_raw(fake_src_ip, dst_ip, ident, seq)
     recv_time = sniff_reply(interface, fake_src_ip, ident, seq, timeout=5)
 
     if recv_time:
         rtt = (recv_time - send_time) * 1000
-        print(f"Ответ получен! RTT: {rtt:.3f} ms")
+        print("Ответ получен! RTT: {:.3f} ms".format(rtt))
+
     else:
         print("Ответ не получен (возможно, пакет был проигнорирован системой)")
 
