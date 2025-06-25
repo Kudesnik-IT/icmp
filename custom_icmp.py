@@ -3,6 +3,7 @@ import struct
 import sys
 import os
 import time
+import fcntl
 from ctypes import *
 
 # Проверка запуска от root
@@ -10,11 +11,12 @@ if os.geteuid() != 0:
     print("Ошибка: Требуются права root (sudo)")
     sys.exit(1)
 
-# ICMP типы
-ICMP_ECHO_REQUEST = 8  # Echo Request
-ICMP_ECHO_REPLY = 0    # Echo Reply
+# Константы
+ICMP_ECHO_REQUEST = 8
+ICMP_ECHO_REPLY = 0
+ETH_P_ALL = 0x0003
 
-# IP заголовок (через ctypes)
+# IP заголовок
 class IP(Structure):
     _fields_ = [
         ("ihl", c_ubyte, 4),
@@ -40,32 +42,24 @@ class ICMP(Structure):
         ("sequence", c_ushort)
     ]
 
-# Посчитать контрольную сумму
 def checksum(source_string):
     sum = 0
     count_to = (len(source_string) // 2) * 2
     count = 0
-
     while count < count_to:
         this_val = source_string[count + 1] * 256 + source_string[count]
         sum += this_val
         count += 2
-
     if count_to < len(source_string):
         sum += source_string[len(source_string) - 1]
-
     sum = (sum >> 16) + (sum & 0xFFFF)
     sum += (sum >> 16)
-    answer = ~sum
-    answer &= 0xFFFF
-    answer = answer >> 8 | (answer << 8 & 0xFF00)
-    return answer
+    answer = ~sum & 0xFFFF
+    return answer >> 8 | (answer << 8 & 0xFF00)
 
-# Преобразование IP в сетевой порядок байт
 def ip2bin(ip):
-    return struct.unpack("I", socket.inet_aton(ip))[0]
+    return struct.unpack("!I", socket.inet_aton(ip))[0]
 
-# Создание ICMP пакета
 def create_icmp_packet(identifier=1, sequence=1):
     icmp = ICMP(
         type=ICMP_ECHO_REQUEST,
@@ -78,13 +72,12 @@ def create_icmp_packet(identifier=1, sequence=1):
     icmp.checksum = socket.htons(checksum(buf))
     return bytes(icmp)
 
-# Создание IP пакета
 def create_ip_packet(src_ip, dst_ip):
     ip = IP(
         ihl=5,
         version=4,
         tos=0,
-        len=20 + 8,  # IP + ICMP
+        len=20 + 8,
         id=54321,
         offset=0,
         ttl=255,
@@ -96,31 +89,49 @@ def create_ip_packet(src_ip, dst_ip):
     ip.checksum = socket.htons(checksum(bytes(ip)))
     return bytes(ip)
 
-# Отправка ICMP пакета
 def send_icmp(sock, src_ip, dst_ip, ident, seq):
     icmp_packet = create_icmp_packet(ident, seq)
     ip_packet = create_ip_packet(src_ip, dst_ip)
     packet = ip_packet + icmp_packet
-
     sock.sendto(packet, (dst_ip, 0))
     return time.time()
 
-# Прием ICMP-ответов
-def listen_for_reply(sock, dst_ip, expected_id, expected_seq, timeout=10):
-    sock.settimeout(timeout)
+def get_mac(interface):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return fcntl.ioctl(
+        s.fileno(),
+        0x8927,
+        struct.pack('256s', interface[:15].encode())
+    )[18:24]
 
+def listen_for_reply_packet_mode(sock, dst_ip, expected_id, expected_seq, timeout=10):
+    sock.settimeout(timeout)
     try:
         while True:
-            packet, addr = sock.recvfrom(1024)
-            ip_header = packet[0:20]
-            iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
-            received_ip = socket.inet_ntoa(iph[8])  # src of IP header
+            packet = sock.recv(65535)
+            if len(packet) < 42:
+                continue
 
-            icmph = ICMP.from_buffer_copy(packet[20:28])
-            if icmph.type == ICMP_ECHO_REPLY and received_ip == dst_ip:
+            eth_proto = struct.unpack('!H', packet[12:14])[0]
+            if eth_proto != 0x0800:
+                continue
+
+            ip_header = packet[14:34]
+            iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+            protocol = iph[6]
+            if protocol != 1:
+                continue
+
+            src_ip_recv = socket.inet_ntoa(iph[8])
+            dst_ip_recv = socket.inet_ntoa(iph[9])
+            if src_ip_recv != dst_ip:
+                continue
+
+            icmph = ICMP.from_buffer_copy(packet[34:42])
+            if icmph.type == ICMP_ECHO_REPLY:
                 if socket.ntohs(icmph.identifier) == expected_id and socket.ntohs(icmph.sequence) == expected_seq:
                     reply_time = time.time()
-                    rtt_ms = (reply_time - send_time_global) * 1000  # в мс
+                    rtt_ms = (reply_time - send_time_global) * 1000
                     return rtt_ms
     except socket.timeout:
         return None
@@ -144,11 +155,9 @@ def main():
 
     print("ICMP-запросы от {} к {}".format(src_ip, dst_ip))
 
-    # Генерируем уникальный идентификатор на основе PID
-    ident = os.getpid() & 0xFFFF  # Ограничиваем до 16 бит
+    ident = os.getpid() & 0xFFFF
     seq = 1
 
-    # Статистика
     packets_sent = 0
     packets_received = 0
     total_rtt = 0.0
@@ -159,8 +168,8 @@ def main():
         sock_send = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode())
 
-        sock_recv = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sock_recv.bind(("", 0))
+        sock_recv = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+        sock_recv.bind((interface, 0))
 
         while True:
             print("Запрос отправлен - ", end="", flush=True)
@@ -169,7 +178,7 @@ def main():
             global send_time_global
             send_time_global = send_icmp(sock_send, src_ip, dst_ip, ident, seq)
 
-            result = listen_for_reply(sock_recv, dst_ip, ident, seq, timeout=10)
+            result = listen_for_reply_packet_mode(sock_recv, dst_ip, ident, seq, timeout=3)
 
             if result is not None:
                 packets_received += 1
