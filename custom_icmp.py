@@ -104,73 +104,45 @@ def get_mac(interface):
         struct.pack('256s', interface[:15].encode())
     )[18:24]
 
-def listen_for_reply_packet_mode(sock, expected_src_ip, expected_id, expected_seq, timeout=3):
+def listen_for_reply_packet_mode(sock, fake_src_ip, expected_id, expected_seq, timeout=3):
     sock.settimeout(timeout)
     try:
         while True:
             packet = sock.recv(65535)
 
-            # Ethernet + IP + ICMP минимальная длина
+            # Ethernet (14 байт) + IP (минимум 20) + ICMP (8)
             if len(packet) < 42:
                 continue
 
             eth_proto = struct.unpack('!H', packet[12:14])[0]
-            if eth_proto != 0x0800:  # IPv4
+            if eth_proto != 0x0800:  # Не IPv4
                 continue
 
             ip_header = packet[14:34]
             iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
             protocol = iph[6]
-            if protocol != 1:  # ICMP
+            if protocol != 1:  # Не ICMP
                 continue
 
             src_ip = socket.inet_ntoa(iph[8])
             dst_ip = socket.inet_ntoa(iph[9])
 
-            icmp_packet = packet[34:42]
-            icmph = struct.unpack("!BBHHH", icmp_packet)
+            icmp_header = packet[34:42]
+            if len(icmp_header) < 8:
+                continue
 
+            icmph = struct.unpack("!BBHHH", icmp_header)
             icmp_type = icmph[0]
             identifier = icmph[3]
             sequence = icmph[4]
 
-            if icmp_type == ICMP_ECHO_REPLY:
-                if src_ip == expected_src_ip and identifier == socket.htons(expected_id) and sequence == socket.htons(expected_seq):
+            # Только ответы (Echo Reply) на наш фейковый IP
+            if icmp_type == 0:
+                if dst_ip == fake_src_ip and identifier == socket.htons(expected_id) and sequence == socket.htons(expected_seq):
                     return (time.time() - send_time_global) * 1000
     except socket.timeout:
         return None
 
-def listen_for_reply_packet_mode_old(sock, dst_ip, expected_id, expected_seq, timeout=10):
-    sock.settimeout(timeout)
-    try:
-        while True:
-            packet = sock.recv(65535)
-            if len(packet) < 42:
-                continue
-
-            eth_proto = struct.unpack('!H', packet[12:14])[0]
-            if eth_proto != 0x0800:
-                continue
-
-            ip_header = packet[14:34]
-            iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
-            protocol = iph[6]
-            if protocol != 1:
-                continue
-
-            src_ip_recv = socket.inet_ntoa(iph[8])
-            dst_ip_recv = socket.inet_ntoa(iph[9])
-            if src_ip_recv != dst_ip:
-                continue
-
-            icmph = ICMP.from_buffer_copy(packet[34:42])
-            if icmph.type == ICMP_ECHO_REPLY:
-                if socket.ntohs(icmph.identifier) == expected_id and socket.ntohs(icmph.sequence) == expected_seq:
-                    reply_time = time.time()
-                    rtt_ms = (reply_time - send_time_global) * 1000
-                    return rtt_ms
-    except socket.timeout:
-        return None
 
 def main():
     if len(sys.argv) != 4:
