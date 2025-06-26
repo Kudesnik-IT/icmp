@@ -96,65 +96,52 @@ def send_icmp(sock, src_ip, dst_ip, ident, seq):
     sock.sendto(packet, (dst_ip, 0))
     return time.time()
 
-def listen_for_reply(sock_recv, sock_recv_raw, dst_ip, expected_id, expected_seq, timeout=10):
-    sock_recv.settimeout(timeout)
+def listen_for_reply(sock_recv_raw, src_ip, expected_id, expected_seq, timeout=10):
     sock_recv_raw.settimeout(timeout)
-
-    dst_bytes = socket.inet_aton(dst_ip)
 
     try:
         while True:
-            try:
-                packet, addr = sock_recv.recvfrom(1024)
-                ip_header = packet[0:20]
-                iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
-                received_ip = socket.inet_ntoa(iph[8])
+            frame, _ = sock_recv_raw.recvfrom(65535)
 
-                print(received_ip)
-                
-                frame, _ = sock_recv_raw.recvfrom(65535)
-                print("Пакет получен - длина:", len(frame))
+            if len(frame) < 42:
+                continue
 
-                icmph = ICMP.from_buffer_copy(packet[20:28])
-                if icmph.type == ICMP_ECHO_REPLY and received_ip == dst_ip:
-                    if socket.ntohs(icmph.identifier) == expected_id and socket.ntohs(icmph.sequence) == expected_seq:
-                        reply_time = time.time()
-                        return (reply_time - send_time_global) * 1000
-            except socket.timeout:
-                pass
+            eth_type = struct.unpack('!H', frame[12:14])[0]
+            if eth_type != 0x0800:
+                continue
 
-            try:
-                frame, _ = sock_recv_raw.recvfrom(65535)
-                if len(frame) < 42:
-                    continue
+            ip_header = frame[14:34]
+            iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+            protocol = iph[6]
+            if protocol != socket.IPPROTO_ICMP:
+                continue
 
-                eth_proto = struct.unpack('!H', frame[12:14])[0]
-                if eth_proto != 0x0800:
-                    continue
+            ip_src = socket.inet_ntoa(iph[8])
+            ip_dst_str = socket.inet_ntoa(iph[9])
 
-                ip_header = frame[14:34]
-                iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
-                protocol = iph[6]
-                ip_src = iph[8]
-                ip_dst = iph[9]
+            if ip_dst_str != src_ip:
+                continue
 
-                if protocol != socket.IPPROTO_ICMP:
-                    continue
+            icmp_header = frame[34:42]
+            if len(icmp_header) < 8:
+                continue
 
-                if ip_dst != dst_bytes:
-                    continue
+            icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq = struct.unpack('!BBHHH', icmp_header)
 
-                icmp_header = frame[34:42]
-                icmph = struct.unpack('!BBHHH', icmp_header)
+            if icmp_type != ICMP_ECHO_REPLY:
+                continue  # пропустить неответ
 
-                if icmph[0] == ICMP_ECHO_REPLY and icmph[3] == socket.htons(expected_id) and icmph[4] == socket.htons(expected_seq):
+            #print("Получен ICMP от {} - type={} id={} seq={}".format(ip_src, icmp_type, icmp_id, icmp_seq))
+
+            if icmp_type == ICMP_ECHO_REPLY:
+                if icmp_id == expected_id and icmp_seq == expected_seq:
                     reply_time = time.time()
                     return (reply_time - send_time_global) * 1000
-            except socket.timeout:
-                return None
+
 
     except socket.timeout:
         return None
+
 
 def main():
     if len(sys.argv) != 4:
@@ -188,11 +175,9 @@ def main():
         sock_send = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         sock_send.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, interface.encode())
 
-        sock_recv = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sock_recv.bind(("", 0))
-
         sock_recv_raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
         sock_recv_raw.bind((interface, 0))
+
 
         while True:
             print("Запрос отправлен - ", end="", flush=True)
@@ -201,7 +186,7 @@ def main():
             global send_time_global
             send_time_global = send_icmp(sock_send, src_ip, dst_ip, ident, seq)
 
-            result = listen_for_reply(sock_recv, sock_recv_raw, src_ip, ident, seq, timeout=10)
+            result = listen_for_reply(sock_recv_raw, src_ip, ident, seq, timeout=10)
 
             if result is not None:
                 packets_received += 1
